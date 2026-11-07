@@ -2,10 +2,19 @@ package vcard
 
 import (
 	"bufio"
+	"encoding/hex"
 	"errors"
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+)
+
+const (
+	paramEncoding  = "ENCODING"
+	paramCharset   = "CHARSET"
+	encodingQuoted = "QUOTED-PRINTABLE"
+	endCard        = "END:VCARD"
 )
 
 // A Decoder parses cards.
@@ -25,6 +34,10 @@ func (dec *Decoder) readLine() (string, error) {
 		return l, nil
 	} else if err != nil {
 		return l, err
+	}
+
+	if isQuotedPrintableLine(l) {
+		return dec.readQuotedPrintableLines(l)
 	}
 
 	var sb strings.Builder
@@ -54,6 +67,35 @@ func (dec *Decoder) readLine() (string, error) {
 	}
 
 	return sb.String(), nil
+}
+
+// readQuotedPrintableLines joins soft line breaks, which unlike folding are
+// marked by a trailing "=" and need no leading whitespace on the next line.
+func (dec *Decoder) readQuotedPrintableLines(l string) (string, error) {
+	for strings.HasSuffix(l, "=") {
+		l = strings.TrimSuffix(l, "=")
+
+		// A malformed last line must not swallow the end of the card.
+		next, _ := dec.r.Peek(len(endCard))
+		if strings.EqualFold(string(next), endCard) {
+			break
+		}
+
+		continued, err := dec.r.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return l, err
+		}
+		l += strings.TrimRight(continued, "\r\n")
+		if err == io.EOF {
+			break
+		}
+	}
+	return l, nil
+}
+
+func isQuotedPrintableLine(l string) bool {
+	i := strings.IndexByte(l, ':')
+	return i >= 0 && strings.Contains(strings.ToUpper(l[:i]), encodingQuoted)
 }
 
 // Decode parses a single card.
@@ -119,6 +161,7 @@ func parseLine(l string) (key string, field *Field, err error) {
 		}
 	}
 
+	l = decodeQuotedPrintableField(field, l)
 	field.Value = parseValue(l)
 	if key == FieldOrganization {
 		// Preserve component boundaries before generic text unescaping loses them.
@@ -153,8 +196,13 @@ func parseParams(s string) (params Params, tail string, err error) {
 			err = errors.New("vcard: malformed parameters")
 			return
 		}
-		if tail[i] == ';' {
+		if tail[i] != '=' {
+			addBareParam(params, tail[:i])
+			last := tail[i] == ':'
 			tail = tail[i+1:]
+			if last {
+				break
+			}
 			continue
 		}
 
@@ -174,6 +222,20 @@ func parseParams(s string) (params Params, tail string, err error) {
 		}
 	}
 	return
+}
+
+// addBareParam stores a vCard 2.1 parameter that has no name, such as CELL in
+// TEL;CELL:+123, under the name later versions give it.
+func addBareParam(params Params, value string) {
+	if value == "" {
+		return
+	}
+	switch strings.ToUpper(value) {
+	case encodingQuoted, "BASE64", "8BIT", "7BIT":
+		params.Add(paramEncoding, value)
+	default:
+		params.Add(ParamType, value)
+	}
 }
 
 func parseParamValues(s string) (values []string, more bool, tail string, err error) {
@@ -225,6 +287,59 @@ func parseQuoted(s string, quote byte) (value, tail string, err error) {
 	}
 	value = string(buf)
 	return
+}
+
+// decodeQuotedPrintableField returns the decoded value and drops the parameters
+// describing the old encoding, so re-encoding the field cannot claim it again.
+// Values in a character set that cannot be converted are returned unchanged.
+func decodeQuotedPrintableField(field *Field, value string) string {
+	if !strings.EqualFold(field.Params.Get(paramEncoding), encodingQuoted) {
+		return value
+	}
+	decoded, ok := decodeCharset(decodeQuotedPrintable(value), field.Params.Get(paramCharset))
+	if !ok {
+		return value
+	}
+	delete(field.Params, paramEncoding)
+	delete(field.Params, paramCharset)
+	return strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(decoded)
+}
+
+// decodeQuotedPrintable keeps anything that is not a valid escape: vCard
+// exporters are less strict than mime/quotedprintable, which would reject it.
+func decodeQuotedPrintable(s string) []byte {
+	decoded := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '=' && i+2 < len(s) {
+			if b, err := hex.DecodeString(s[i+1 : i+3]); err == nil {
+				decoded = append(decoded, b[0])
+				i += 2
+				continue
+			}
+		}
+		decoded = append(decoded, s[i])
+	}
+	return decoded
+}
+
+// decodeCharset treats a missing CHARSET as UTF-8, falling back to ISO-8859-1,
+// which older exporters often use without declaring it.
+func decodeCharset(b []byte, charset string) (string, bool) {
+	switch strings.ToUpper(charset) {
+	case "", "UTF-8", "UTF8", "US-ASCII":
+		if utf8.Valid(b) {
+			return string(b), true
+		}
+	case "ISO-8859-1", "LATIN1":
+	default:
+		return "", false
+	}
+
+	runes := make([]rune, len(b))
+	for i, c := range b {
+		runes[i] = rune(c)
+	}
+	return string(runes), true
 }
 
 var valueParser = strings.NewReplacer("\\\\", "\\", "\\n", "\n", "\\,", ",")

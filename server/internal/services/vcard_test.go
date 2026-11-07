@@ -238,6 +238,59 @@ func TestImportVCardWithAddress(t *testing.T) {
 	}
 }
 
+func TestImportVCard21PhoneExport(t *testing.T) {
+	svc, _, vaultID, userID := setupVCardTest(t)
+
+	vcardData := "BEGIN:VCARD\r\nVERSION:2.1\r\n" +
+		"N;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=4B=6C=6F=C3=9F;=41=6C=65=78=61=6E=64=65=72;;;\r\n" +
+		"FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=41=6C=65=78=61=6E=64=65=72=20=4B=6C=6F=C3=9F\r\n" +
+		"TEL;CELL:+4915112345678\r\n" +
+		"EMAIL;HOME:alexander@example.com\r\n" +
+		"ADR;HOME;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:;;=48=61=75=70=74=73=74=72=61=C3=9F=65=20=\r\n" +
+		"=35;=4D=C3=BC=6E=63=68=65=6E;;80331;\r\n" +
+		"END:VCARD\r\n"
+
+	result, err := svc.ImportVCard(vaultID, userID, strings.NewReader(vcardData))
+	if err != nil {
+		t.Fatalf("ImportVCard failed: %v", err)
+	}
+	if result.ImportedCount != 1 {
+		t.Fatalf("Expected 1 imported, got %d", result.ImportedCount)
+	}
+
+	contact := result.Contacts[0]
+	if contact.FirstName != "Alexander" || contact.LastName != "Kloß" {
+		t.Errorf("Expected Alexander Kloß, got %q %q", contact.FirstName, contact.LastName)
+	}
+
+	var information []models.ContactInformation
+	svc.db.Where("contact_id = ?", contact.ID).Order("id ASC").Find(&information)
+	if len(information) != 2 {
+		t.Fatalf("Expected phone and email, got %d entries", len(information))
+	}
+	if information[0].Data != "+4915112345678" || information[1].Data != "alexander@example.com" {
+		t.Errorf("Unexpected contact information: %q, %q", information[0].Data, information[1].Data)
+	}
+
+	var pivot models.ContactAddress
+	if err := svc.db.Where("contact_id = ?", contact.ID).First(&pivot).Error; err != nil {
+		t.Fatalf("ContactAddress not found: %v", err)
+	}
+	var addr models.Address
+	if err := svc.db.First(&addr, "id = ?", pivot.AddressID).Error; err != nil {
+		t.Fatalf("Address not found: %v", err)
+	}
+	if ptrToStr(addr.Line1) != "Hauptstraße 5" {
+		t.Errorf("Expected Line1 'Hauptstraße 5', got %q", ptrToStr(addr.Line1))
+	}
+	if ptrToStr(addr.City) != "München" {
+		t.Errorf("Expected City 'München', got %q", ptrToStr(addr.City))
+	}
+	if ptrToStr(addr.PostalCode) != "80331" {
+		t.Errorf("Expected PostalCode '80331', got %q", ptrToStr(addr.PostalCode))
+	}
+}
+
 func TestImportVCardWithBirthday(t *testing.T) {
 	svc, _, vaultID, userID := setupVCardTest(t)
 
